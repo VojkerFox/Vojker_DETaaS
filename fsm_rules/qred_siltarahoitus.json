@@ -1,0 +1,12 @@
+{
+    "asiakas": "Qred",
+    "fsm_tila": "AKUUTTI_SILTARAHOITUS",
+    "panama_ehdot": {
+        "min_liikevaihto_eur": 100000.0,
+        "max_verovelka_eur": 50000.0,
+        "kielletyt_toimialat": ["rakennus", "ravintola"]
+    },
+    "hinnoittelu": {
+        "hinta_per_liidi_eur": 5.0
+    }
+}
