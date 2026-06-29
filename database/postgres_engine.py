@@ -1,110 +1,131 @@
 import os
-import sys
+import re
+import shutil
 import psycopg2
-import fitz  # Tämä on se PyMuPDF, jonka juuri asensit!
-from jax_engine.vectorizer import model  # sentence-transformers neuroverkko
+import fitz  # PyMuPDF
+from jax_engine.vectorizer import model
 
-# TIETOKANNAN KYTKENTÄTIEDOT (Päivitä salasanasi tähän)
+# TIETOKANNAN ASETUKSET
 DB_CONFIG = {
-    "dbname": "vojker_detaas",       # pgAdminin tietokannan nimi
-    "user": "postgres",         # Käyttäjätunnus
-    "password": "password", # <-- LAITA TÄHÄN OMA PGADMIN-SALASANASI
+    "dbname": "vojker_detaas",          
+    "user": "postgres",
+    "password": "password", # <- LAITA OMA SALASANASI
     "host": "localhost",
     "port": "5432"
 }
 
+# KANSIORAKENTEEN VAKIOINTI (Luo nämä kansiot projektisi juureen!)
+INPUT_DIR = "pdf_syote"    # Tänne vain dumppaat uudet lehdet
+ARCHIVE_DIR = "pdf_arkisto" # Kone siirtää valmiit lehdet tänne automaattisesti
+
+def setup_folders():
+    """Varmistaa, että LEAN-kansionhallinta on pystyssä."""
+    if not os.path.exists(INPUT_DIR):
+        os.makedirs(INPUT_DIR)
+    if not os.path.exists(ARCHIVE_DIR):
+        os.makedirs(ARCHIVE_DIR)
+
 def get_connection():
-    """Ottaa yhteyden ja kääntää istunnon suoraan vojker_detaas -skeemaan."""
     conn = psycopg2.connect(**DB_CONFIG)
     cur = conn.cursor()
     cur.execute("SET search_path TO vojker_detaas, public;")
-    cur.close()
-    return conn
+    return conn, cur
 
-def ingest_pdf_to_postgres(pdf_polku, lehti_nimi, vuosi, kuukausi):
-    """
-    Avaa aidon PDF-tiedoston, lukee sen sivu sivulta ja rivi riviltä,
-    laskee tensolit neuroverkolla ja tallentaa kaiken PostgreSQL:ään.
-    """
-    if not os.path.exists(pdf_polku):
-        print(f"\n❌ Virhe: PDF-tiedostoa ei löydy polusta: {pdf_polku}")
-        print("👉 Vinkki: Laita tiedosto esim. projektin juureen ja anna sen nimi tähän.")
+def process_single_pdf(pdf_path, filename, cur):
+    """Pureskelee yhden PDF:n älykkäiksi lohkoiksi kantaan."""
+    # VAKIOITU NIMEN LUKU: Puretaan esim. "EuroMetalli_2026_Kesakuu.pdf" alaviivoista
+    clean_name = filename.replace(".pdf", "")
+    parts = clean_name.split("_")
+    
+    if len(parts) < 3:
+        print(f"⚠️ Ohitetaan tiedosto {filename}: Nimen on oltava muotoa Lehti_Vuosi_Kuukausi.pdf")
+        return False
+        
+    lehti_nimi = parts[0]
+    vuosi = int(parts[1])
+    kuukausi = parts[2]
+    
+    print(f"\n📖 Automaatio havaitsi uuden lehden: {lehti_nimi} ({kuukausi} {vuosi})")
+    doc = fitz.open(pdf_path)
+    
+    cur.execute(
+        "INSERT INTO julkaisut (lehti_nimi, vuosi, kuukausi) VALUES (%s, %s, %s) RETURNING id;",
+        (lehti_nimi, vuosi, kuukausi)
+    )
+    julkaisu_id = cur.fetchone()[0]
+    
+    block_counter = 0
+    for sivu_idx, page in enumerate(doc):
+        sivu_nro = sivu_idx + 1
+        blocks = page.get_text("blocks")
+        cleaned_paragraphs = []
+        
+        for b in blocks:
+            block_text = b[4].strip()
+            if len(block_text) > 15 and b[6] == 0:  
+                clean_text = block_text.replace("-\n", "").replace("\n", " ")
+                cleaned_paragraphs.append(clean_text)
+        
+        if not cleaned_paragraphs:
+            continue
+            
+        cur.execute(
+            "INSERT INTO sivut (julkaisu_id, sivu_numero) VALUES (%s, %s) RETURNING id;",
+            (julkaisu_id, sivu_nro)
+        )
+        sivu_id = cur.fetchone()[0]
+        
+        # JAX-tensorointi livenä
+        vectors = model.encode(cleaned_paragraphs, show_progress_bar=False)
+        
+        for block_nro, (text, vec) in enumerate(zip(cleaned_paragraphs, vectors), start=1):
+            cur.execute(
+                "INSERT INTO tekstirivit (sivu_id, rivi_numero, teksti, embedding) VALUES (%s, %s, %s, %s);",
+                (sivu_id, block_nro, text, vec.tolist())
+            )
+            block_counter += 1
+            
+    doc.close()
+    print(f"✅ Suoritettu: {filename} ({block_counter} laadukasta lohkoa valettu tietokantaan).")
+    return True
+
+def run_auto_pipeline():
+    setup_folders()
+    conn, cur = get_connection()
+    
+    # Huom: Poistettu TRUNCATE, jotta uudet lehdet LISÄTÄÄN vanhojen alle, ei pyyhitä yli!
+    
+    pdf_files = [f for f in os.listdir(INPUT_DIR) if f.endswith(".pdf")]
+    
+    if not pdf_files:
+        print(f"ℹ️ Kansio '{INPUT_DIR}' on tyhjä. Ei uutta materiaalia käsiteltävänä.")
+        cur.close()
+        conn.close()
         return
 
-    print(f"\n📖 Avataan aito PDF-dokumentti: {pdf_polku}")
-    doc = fitz.open(pdf_polku)
-    total_pages = len(doc)
-    print(f"     -> Dokumentissa on {total_pages} sivua. Käynnistetään louhinta...")
-
-    conn = get_connection()
-    cur = conn.cursor()
+    print(f"🚀 Löydetty {len(pdf_files)} uutta PDF-tiedostoa. Käynnistetään LEAN-linjasto...")
     
     try:
-        # 1. Lisätään julkaisun perustiedot
-        cur.execute(
-            "INSERT INTO julkaisut (lehti_nimi, vuosi, kuukausi) VALUES (%s, %s, %s) RETURNING id;",
-            (lehti_nimi, vuosi, kuukausi)
-        )
-        julkaisu_id = cur.fetchone()[0]
-        
-        total_lines_inserted = 0
-        
-        # 2. Rullataan aito dokumentti sivu sivulta (fitz indeksoi sivut nollasta)
-        for sivu_idx, page in enumerate(doc):
-            sivu_nro = sivu_idx + 1
+        for filename in pdf_files:
+            source_path = os.path.join(INPUT_DIR, filename)
+            dest_path = os.path.join(ARCHIVE_DIR, filename)
             
-            # Poimitaan sivun puhdas teksti
-            sivu_teksti = page.get_text("text")
+            # Prosessoidaan tiedosto
+            success = process_single_pdf(source_path, filename, cur)
             
-            # Pilkotaan teksti yksittäisiksi riveiksi
-            rivit = [r.strip() for r in sivu_teksti.split("\n") if r.strip()]
-            if not rivit:
-                continue # Ohitetaan tyhjät sivut (kuten pelkät kuvat)
-                
-            cur.execute(
-                "INSERT INTO sivut (julkaisu_id, sivu_numero) VALUES (%s, %s) RETURNING id;",
-                (julkaisu_id, sivu_nro)
-            )
-            sivu_id = cur.fetchone()[0]
-            
-            # Lasketaan tekoälyvektorit kerralla koko sivun riveille (Batch-ajo)
-            vektorit = model.encode(rivit, show_progress_bar=False)
-            
-            # 3. Tallennetaan rivi riviltä tietokantaan
-            for rivi_nro, (teksti, vektori) in enumerate(zip(rivit, vektorit), start=1):
-                # Muutetaan numpy-vektori tavalliseksi listaksi, jonka REAL[] ymmärtää natively
-                emb_list = vektori.tolist()
-                
-                cur.execute(
-                    "INSERT INTO tekstirivit (sivu_id, rivi_numero, teksti, embedding) VALUES (%s, %s, %s, %s);",
-                    (sivu_id, rivi_nro, teksti, emb_list)
-                )
-                total_lines_inserted += 1
-                
-            print(f"     -> Sivu {sivu_nro}/{total_pages} ajettu kantaan... ({len(rivit)} riviä)")
+            if success:
+                # SIIRRETÄÄN VALMIS TIEODSTO ARKISTOON (Tärkeä! Estää tuplalataukset)
+                shutil.move(source_path, dest_path)
+                print(f"📦 Tiedosto siirretty arkistoon: {ARCHIVE_DIR}/{filename}")
                 
         conn.commit()
-        print(f"\n✅ Teollinen PDF-louhinta valmis!")
-        print(f"📁 Julkaisu: {lehti_nimi} ({kuukausi} / {vuosi})")
-        print(f"🚀 Tietokantaan räjäytetty yhteensä: {total_lines_inserted} aitoa tekstiriviä tensoreineen.")
-        
+        print("\n⚡ Kaikki uudet materiaalit käsitelty onnistuneesti.")
     except Exception as e:
         conn.rollback()
-        print(f"❌ Kriittinen virhe tietokanta-ajossa: {e}")
+        print(f"❌ VIRHE LINJASTOLLA: {e}")
     finally:
         cur.close()
         conn.close()
-        doc.close()
 
 if __name__ == "__main__":
-    # TÄSSÄ MÄÄRITETÄÄN REITTI JA TIEDOSTO
-    # Voit ladata minkä tahansa koneellasi olevan PDF-lehden laittamalla sen polun tähän!
-    AITO_PDF_REITTI = "konekuriiri_kesakuu.pdf" 
-    
-    print("==========================================================")
-    print("VOJKER DETaaS - AITO PDF -> POSTGRESQL INGESTION PIPELINE")
-    print("==========================================================")
-    
-    # KÄYNNISTETÄÄN LATAUS
-    # Muuta tiedoston nimi yläpuolelta sellaiseksi, joka sinulla on kansiossa.
-    ingest_pdf_to_postgres(AITO_PDF_REITTI, "Konekuriiri", 2026, "Kesäkuu")
+    run_auto_pipeline()
